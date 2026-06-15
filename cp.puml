@@ -1,3 +1,5 @@
+```plantuml
+
 @startuml クーポン配布システム
 
 title クーポン配布システム Data Flow Diagram
@@ -47,3 +49,4 @@ end note
 
 stop
 @enduml
+```
