@@ -112,3 +112,56 @@ end note
 stop
 @enduml
 ```
+
+```plantuml
+
+@startuml クーポン配布システム
+
+title クーポン配布システム Data Flow Diagram
+
+|アスクル管理Web|
+start
+:クーポン登録画面;
+:クーポン情報の入力;
+note right #skyblue
+  クーポン情報
+end note
+
+|アスクル管理Server|
+    :クーポン登録API;
+    note right #orange
+    ユーザー情報
+    クーポンマスタ
+  end note
+  
+  |アスクル管理Web|
+  :クーポン登録結果表示;
+
+  :クーポン一覧画面;
+
+  |アスクル管理Server|  
+  :ユーザーへクーポン紐付け;
+  note right
+    **[データ更新]**
+    D3: 配布履歴 (所持フラグ)
+  end note
+
+|アプリ|
+:クーポン詳細の確認;
+note right
+  **[データ参照]**
+  D3: 配布履歴
+  D1: クーポンマスタ
+end note
+
+|アプリServer|
+:エンドクーポン詳細の確認;
+note right
+  **[データ参照]**
+  D3: 配布履歴
+  D1: クーポンマスタ
+end note
+
+stop
+@enduml
+```
