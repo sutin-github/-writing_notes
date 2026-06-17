@@ -1917,14 +1917,17 @@ class UserService(private val userRepository: UserRepository) {
 ------------------------------
 ## 3. Querydslでの具体的な結合条件（INNER / LEFT JOIN）の書き方
 3つのテーブルを結合し、必要なカラムだけを抽出してドメインモデル（またはDTO）に一発変換するクエリです。要件に合わせて join（INNER JOIN）と leftJoin（LEFT JOIN）を使い分けます。
+
 ## 抽出先のドメインモデル（Dataクラス）
 
+```kt
 data class UserRoleDetail(
     val userId: String,
     val userName: String,
     val roleName: String?,      // LEFT JOINを考慮してNull許容にする
     val assignedAt: LocalDateTime? // LEFT JOINを考慮してNull許容にする
 )
+```
 
 ## Querydslによるクエリ実装
 
