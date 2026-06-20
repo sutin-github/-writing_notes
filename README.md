@@ -132,6 +132,25 @@
   - [1. 動的JOINとページングを含む実装例](#1-動的joinとページングを含む実装例)
   - [2. サービス層（呼び出し側）での使い方](#2-サービス層呼び出し側での使い方)
   - [💡 ページングと動的JOINを扱う際の知恵袋](#-ページングと動的joinを扱う際の知恵袋)
+- [Spring Data JPA Blaze-Persistence 複雑なクエリ 実装 sample](#spring-data-jpa-blaze-persistence-複雑なクエリ-実装-sample)
+  - [1. 前提のエンティティモデル](#1-前提のエンティティモデル)
+  - [2. サンプル1: Core API (CriteriaBuilder) による複雑な動的クエリ](#2-サンプル1-core-api-criteriabuilder-による複雑な動的クエリ)
+  - [リポジトリのカスタム実装 \[6\]](#リポジトリのカスタム実装-6)
+  - [3. サンプル2: Entity-View と BlazeSpecification による実装 \[3, 7\]](#3-サンプル2-entity-view-と-blazespecification-による実装-3-7)
+  - [エンティティビューの定義](#エンティティビューの定義)
+  - [リポジトリとサービス](#リポジトリとサービス)
+  - [まとめ：なぜ Blaze-Persistence を使うのか](#まとめなぜ-blaze-persistence-を使うのか)
+- [Spring Data JPA と \[Blaze-Persistence\] を詳しく](#spring-data-jpa-と-blaze-persistence-を詳しく)
+  - [JPA の限界（メモリ内でのN+1力技ページング、不格好な GROUP BY）を綺麗に解消するテクニックです。](#jpa-の限界メモリ内でのn1力技ページング不格好な-group-byを綺麗に解消するテクニックです)
+  - [1. 完全なサンプルコード（エンティティ定義）](#1-完全なサンプルコードエンティティ定義)
+  - [2. 深掘り：Core API による「集計・条件分岐・ページング」](#2-深掘りcore-api-による集計条件分岐ページング)
+  - [拡張リポジトリの実装](#拡張リポジトリの実装)
+  - [3. 深掘り：Entity-View による「サブクエリ・相関Window関数」](#3-深掘りentity-view-によるサブクエリ相関window関数)
+  - [Entity-View の定義](#entity-view-の定義)
+  - [サブクエリプロバイダの実装](#サブクエリプロバイダの実装)
+  - [4. Spring Data JPA リポジトリとの完全な統合](#4-spring-data-jpa-リポジトリとの完全な統合)
+  - [サービス層での呼び出し方](#サービス層での呼び出し方)
+  - [💡 さらに詳細な実装に向けたステップ](#-さらに詳細な実装に向けたステップ)
 
 
 # detektPlugins
@@ -2100,7 +2119,7 @@ import org.springframework.transaction.annotation.Transactional
 @Service
 class UserRoleSearchService(private val userRoleQueryRepository: UserRoleQueryRepository) {
 
-    @Transactional(readOnly = true)
+    @Transactional(readOnly = true) 
     fun getPagedUserRoles(page: Int, size: Int, hasRoleOnly: Boolean): Page<UserRoleDetail> {
         // ページング条件を作成（例：0ページ目から、1ページ20件）
         val pageable = PageRequest.of(page, size)
@@ -2121,4 +2140,313 @@ class UserRoleSearchService(private val userRoleQueryRepository: UserRoleQueryRe
 
 これで、JPAによる安全な更新、Querydslによる多対多の動的結合、そしてドメインモデルへのページング付き一発変換までが綺麗に繋がりました。
 実際の画面やAPIの要件において、「ソート（並び替え順）の動的指定」や「これら以外の複雑な絞り込み条件（キーワード検索など）」を追加したい部分はありますか？不詳な点があればお気軽にお知らせください。
+
+# Spring Data JPA Blaze-Persistence 複雑なクエリ 実装 sample
+
+Spring Data JPA と [Blaze-Persistence](https://github.com/Blazebit/blaze-persistence) を組み合わせて、動的な複雑なクエリ（複数結合・集計・条件分岐・ページングなど）をクリーンに実装するサンプルです。 [1, 2, 3]   
+Blaze-Persistence は、JPA 標準の Criteria API よりもはるかに強力な CriteriaBuilder と、効率的な DTO 投影を可能にする Entity-View モジュールを提供します。 [1, 2] 
+
+------------------------------
+## 1. 前提のエンティティモデル
+例として、「注文（Order）」「注文明細（OrderItem）」「顧客（Customer）」の関係を扱います。
+
+// Order (o) <-1:N-> OrderItem (i), Order (o) <-N:1-> Customer (c)
+
+コードの詳細は などを参照。 [1] 
+
+------------------------------
+## 2. サンプル1: Core API (CriteriaBuilder) による複雑な動的クエリ
+集計関数（SUM）、複数テーブルの JOIN、動的な条件（WHERE）、およびページングを1つのクエリで完結させます。標準 JPA で発生しがちな「JOIN FETCH とページングの併用によるメモリ内全件ソート問題」を回避できます。 [4, 5] 
+
+## リポジトリのカスタム実装 [6] 
+
+```kt
+@Repository
+public class OrderCustomRepositoryImpl implements OrderCustomRepository {
+    @PersistenceContext private EntityManager em;
+    private final CriteriaBuilderFactory cbf;
+
+    public OrderCustomRepositoryImpl(CriteriaBuilderFactory cbf) { this.cbf = cbf; }
+
+    @Override
+    public PagedList<OrderSummaryDto> searchOrders(OrderSearchCondition cond, int firstResult, int maxResults) {
+        var cb = cbf.create(em, OrderSummaryDto.class)
+            .from(Order.class, "o")
+            .leftJoin("o.customer", "c")
+            .leftJoin("o.items", "i")
+            .select("o.id").select("c.name").select("o.orderDate")
+            .select("SUM(i.price * i.quantity)") // 集計
+            .whereOr()
+                .where("o.status").eq(cond.getStatus())
+                .where("c.region").eq("TOKYO")
+            .endOr();
+
+        if (cond.getMinPrice() != null) {
+            cb.having("SUM(i.price * i.quantity)").ge(cond.getMinPrice());
+        }
+
+        return cb.orderByDesc("o.orderDate").page(firstResult, maxResults).getResultList();
+    }
+}
+```
+
+------------------------------
+## 3. サンプル2: Entity-View と BlazeSpecification による実装 [3, 7] 
+より宣言的に複雑なデータ構造（ネストしたDTO、ウインドウ関数や条件付き集計）を取得したい場合は、Entity-View と Spring Data JPA のリポジトリ統合が最も強力です。 [1, 2, 3, 8] 
+## エンティティビューの定義
+
+```kts
+@EntityView(Order.class)
+public interface OrderDetailView {
+    @IdMapping Long getId();
+    @Mapping("customer.name") String getCustomerName();
+    LocalDateTime getOrderDate();
+    @Mapping("SUM(items.price * items.quantity)") Long getTotalAmount();
+}
+```
+
+## リポジトリとサービス
+EntityViewRepository を利用し、BlazeSpecification で動的フィルタリングを行います。 [7, 9] 
+
+```java
+// Repository
+public interface OrderViewRepository extends EntityViewRepository<OrderDetailView, Long> {
+    List<OrderDetailView> findAll(BlazeSpecification spec);
+}
+// Service (概要)
+@Transactional(readOnly = true)public List<OrderDetailView> getOrders(String status) {
+    return orderViewRepository.findAll((rootAlias, cb) -> 
+        cb.where(rootAlias + ".status").eq(status));
+}
+```
+
+------------------------------
+## まとめ：なぜ Blaze-Persistence を使うのか
+
+* GROUP BY の自動生成: select 句に集計関数を含めるだけで、必要な GROUP BY を自動構成します。
+* ページングの最適化: 1対多の結合があっても、データベース側で完結する高速なページング SQL を生成します。 [1, 5, 8] 
+
+もし特定の複雑な SQL（ウィンドウ関数、CTE (共通テーブル式)、または特定のデータベース特有の関数など）を Java 側でどう表現すべきか迷っている場合は、具体的な SQLイメージ や 実現したい条件 を教えてください。適切なクエリビルダーの構築方法を提案します。
+
+[1] [https://github.com](https://github.com/Blazebit/blaze-persistence)  
+[2] [https://piotrminkowski.com](https://piotrminkowski.com/2023/01/30/useful-unknown-java-libraries/)  
+[3] [https://stackoverflow.com](https://stackoverflow.com/questions/62944053/fetch-join-hibernate-conditionally-or-change-the-entity-design-to-conditional-fe)  
+[4] [https://stackoverflow.com](https://stackoverflow.com/questions/79310303/blaze-persistance-fetching-related-entities-with-pagination-in-single-query)  
+[5] [https://vladmihalcea.com](https://vladmihalcea.com/join-fetch-pagination-spring/)  
+[6] [https://spring.pleiades.io](https://spring.pleiades.io/spring-data/jpa/reference/jpa/query-methods.html)  
+[7] [https://persistence.blazebit.com](https://persistence.blazebit.com/documentation/1.6/entity-view/manual/en_US/)  
+[8] [https://modern-sql.com](https://modern-sql.com/blog/2020-09/blaze-persistence)  
+[9] [https://github.com](https://github.com/Blazebit/blaze-persistence/issues/1869)  
+
+# Spring Data JPA と [Blaze-Persistence] を詳しく
+
+Spring Data JPA と [Blaze-Persistence](https://github.com/Blazebit/blaze-persistence) を用いた、実務レベルのさらに高度で具体的な実装サンプルを詳しく解説します。
+JPA の限界（メモリ内でのN+1力技ページング、不格好な GROUP BY）を綺麗に解消するテクニックです。
+------------------------------
+## 1. 完全なサンプルコード（エンティティ定義）
+まず、今回のクエリ対象となる標準的な JPA エンティティ関係を定義します。
+
+```java
+@Entity @Table(name = "orders")public class Order {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String status;
+    private LocalDateTime orderDate;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "customer_id")
+    private Customer customer;
+
+    @OneToMany(mappedBy = "order", cascade = CascadeType.ALL)
+    private List<OrderItem> items = new ArrayList<>();
+    // getter, setter
+}
+
+@Entity @Table(name = "order_items")public class OrderItem {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private Long price;
+    private Long quantity;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "order_id")
+    private Order order;
+}
+```
+
+------------------------------
+## 2. 深掘り：Core API による「集計・条件分岐・ページング」
+Blaze-Persistence の最大の強みは、「1対多の関係（Order -> OrderItem）をJOINしながら、DB側で正確に限界値（LIMIT/OFFSET）制御したページングができる」 点です。
+## 拡張リポジトリの実装
+JPA の Tuple ではなく、自作のレスポンス用 DTO（OrderSearchResponse）に直接マッピング する動的クエリです。
+
+```java
+import com.blazebit.persistence.CriteriaBuilderFactory;
+import com.blazebit.persistence.PagedList;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public class OrderCustomRepositoryImpl implements OrderCustomRepository {
+
+    @PersistenceContext
+    private EntityManager em;
+    
+    private final CriteriaBuilderFactory cbf;
+
+    // コンストラクタ注入
+    public OrderCustomRepositoryImpl(CriteriaBuilderFactory cbf) {
+        this.cbf = cbf;
+    }
+
+    @Override
+    public PagedList<OrderSearchResponse> searchOrders(OrderSearchCondition cond, int page, int size) {
+        
+        // 1. DTOクラスを指定してクエリビルダーを生成
+        var cb = cbf.create(em, OrderSearchResponse.class)
+            .from(Order.class, "o")
+            .leftJoin("o.customer", "c")
+            .leftJoin("o.items", "i")
+            
+            // 2. DTOのコンストラクタ引数の順にSELECTをバインド
+            .select("o.id")
+            .select("c.name")
+            .select("o.orderDate")
+            .select("SUM(i.price * i.quantity)") // 合計金額の計算
+            
+            // 3. 動的WHERE句の構築
+            .whereOr()
+                .where("o.status").eq(cond.getStatus())
+                .where("c.region").eq("TOKYO")
+            .endOr();
+
+        // 4. 動的HAVING句（集計結果に対するフィルタ）
+        if (cond.getMinPrice() != null) {
+            cb.having("SUM(i.price * i.quantity)").ge(cond.getMinPrice());
+        }
+
+        // 5. 並び替えと「DB側完結」の安全なページング実行
+        return cb.orderByDesc("o.orderDate")
+                 .orderByAsc("o.id")
+                 .page((page - 1) * size, size) // 任意のオフセットとサイズ
+                 .getResultList();
+    }
+}
+```
+
+* 自動 GROUP BY: SUM() などの集計関数を指定すると、Blaze-Persistence が背後で GROUP BY o.id, c.name, o.orderDate を自動で SQL に付与してくれます。手動で記述する必要はありません。
+
+------------------------------
+## 3. 深掘り：Entity-View による「サブクエリ・相関Window関数」
+DTO へのマッピングすら記述したくない、または 「各顧客の直近の注文金額」のような高度な分析クエリ を含めたい場合は、Entity-View が真価を発揮します [[1.2.1](https://persistence.blazebit.com/documentation/1.2/entity-view/manual/en_US/index.html)].  
+## Entity-View の定義
+インターフェースにアノテーションを付加するだけで、任意の JPQL 表現やサブクエリ、結合データをマッピングできます。
+
+```java
+import com.blazebit.persistence.view.EntityView;
+import com.blazebit.persistence.view.IdMapping;
+import com.blazebit.persistence.view.Mapping;
+import com.blazebit.persistence.view.MappingSubquery;
+
+@EntityView(Order.class)
+public interface OrderDetailView {
+
+    @IdMapping
+    Long getId();
+
+    @Mapping("customer.name")
+    String getCustomerName();
+
+    // 1対多のコレクションもそのままDTO化可能
+    @Mapping("items")
+    Set<OrderItemView> getItems();
+
+    // JPQLのインライン集計式
+    @Mapping("SUM(items.price * items.quantity)")
+    Long getTotalAmount();
+
+    // サブクエリを用いた複雑な計算（例：この顧客の過去全注文の平均金額）
+    @MappingSubquery(CustomerAvgOrderAmountProvider.class)
+    Long getCustomerAvgAmount();
+}
+```
+
+## サブクエリプロバイダの実装
+
+```java
+import com.blazebit.persistence.SubqueryInitiator;
+import com.blazebit.persistence.view.SubqueryProvider;
+public class CustomerAvgOrderAmountProvider implements SubqueryProvider {
+    @Override
+    public <T> T createSubquery(SubqueryInitiator<T> subqueryInitiator) {
+        return subqueryInitiator
+            .from(Order.class, "subO")
+            .select("AVG(subI.price * subI.quantity)")
+            .leftJoin("subO.items", "subI")
+            // 外部クエリ（EMBEDDING_VIEW）の顧客IDと相関条件を結ぶ
+            .where("subO.customer.id").eqExpression("EMBEDDING_VIEW(customer.id)")
+            .end();
+    }
+}
+```
+
+------------------------------
+## 4. Spring Data JPA リポジトリとの完全な統合
+上記で作成した Entity-View は、Spring Data JPA のリポジトリインターフェースを介して、1行も SQL/JPQL を書かずに取得可能です。
+
+```java
+import com.blazebit.persistence.spring.data.repository.EntityViewRepository;
+import com.blazebit.persistence.spring.data.repository.BlazeSpecification;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface OrderViewRepository extends EntityViewRepository<OrderDetailView, Long> {
+
+    // メソッド名ベースのクエリもEntity-Viewを返却可能
+    List<OrderDetailView> findByStatus(String status);
+
+    // Spring Dataの Pageable と BlazeSpecification を組み合わせた最強の動的検索
+    Page<OrderDetailView> findAll(BlazeSpecification spec, Pageable pageable);
+}
+```
+
+## サービス層での呼び出し方
+BlazeSpecification を用いることで、Criteria API よりも遥かにシンプルに動的条件を組み立てられます。
+
+```java
+@Service
+public class OrderService {
+
+    @Autowired
+    private OrderViewRepository orderViewRepository;
+
+    public Page<OrderDetailView> advancedSearch(String status, Long minAmount, Pageable pageable) {
+        
+        // 動的な条件構築
+        BlazeSpecification spec = (rootAlias, cb) -> {
+            if (status != null) {
+                cb.where(rootAlias + ".status").eq(status);
+            }
+            // 集計値などに対するフィルタリングが必要な場合はhavingも指定可能
+            if (minAmount != null) {
+                cb.having("SUM(" + rootAlias + ".items.price * " + rootAlias + ".items.quantity)").ge(minAmount);
+            }
+        };
+
+        return orderViewRepository.findAll(spec, pageable);
+    }
+}
+```
+
+------------------------------
+## 💡 さらに詳細な実装に向けたステップ
+もし、実務で対応しようとしている特定の SQL パターンがある場合は、以下を教えてください。最適な実装方法を提示します。
+
+* CTE (共通テーブル式) を使った再帰クエリ（組織階層構造など）の表現
+* Window関数 (ROW_NUMBER() OVER (...)) を用いた最新レコードの抽出
+* 既存の ネイティブSQL をどのように Entity-View に移植するか
+
 
