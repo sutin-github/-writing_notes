@@ -2214,7 +2214,8 @@ public interface OrderViewRepository extends EntityViewRepository<OrderDetailVie
     List<OrderDetailView> findAll(BlazeSpecification spec);
 }
 // Service (概要)
-@Transactional(readOnly = true)public List<OrderDetailView> getOrders(String status) {
+@Transactional(readOnly = true)
+public List<OrderDetailView> getOrders(String status) {
     return orderViewRepository.findAll((rootAlias, cb) -> 
         cb.where(rootAlias + ".status").eq(status));
 }
