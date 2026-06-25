@@ -321,6 +321,7 @@ Cognito はログイン時に IDトークン と アクセストークン の両
 
 Spring Boot と PostgreSQL を使用する場合、Cognito のユーザー情報と自前 DB（PostgreSQL）の情報を紐付ける鍵は、Cognito が発行する sub（Subject）と呼ばれる一意のユーザーID です。
 以下に、紐付けの設計パターン、DBスキーマ構成、そして Spring Boot での実装手順を解説します。
+
 ------------------------------
 ## 1. 紐付けの基本設計（DBスキーマ）
 Cognito 側でユーザーが作成されると、自動的に 12345678-abcd-1234-abcd-1234567890ab のような UUID（sub）が割り当てられます。
