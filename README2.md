@@ -313,3 +313,143 @@ Cognito はログイン時に IDトークン と アクセストークン の両
 [10] [https://zenn.dev](https://zenn.dev/kurimeg/articles/999a308705ff80)
 [11] [https://github.com](https://github.com/aws-amplify/amplify-android/issues/2826)
 
+## Spring Boot を使う。PostgreSQLで管理するユーザー情報と Cognito をどう紐付けるかを教えて
+
+Spring Boot と PostgreSQL を使用する場合、Cognito のユーザー情報と自前 DB（PostgreSQL）の情報を紐付ける鍵は、Cognito が発行する sub（Subject）と呼ばれる一意のユーザーID です。
+以下に、紐付けの設計パターン、DBスキーマ構成、そして Spring Boot での実装手順を解説します。
+------------------------------
+## 1. 紐付けの基本設計（DBスキーマ）
+Cognito 側でユーザーが作成されると、自動的に 12345678-abcd-1234-abcd-1234567890ab のような UUID（sub）が割り当てられます。
+PostgreSQL の users テーブルには、この sub を格納するカラム（cognito_sub）を作成し、一意制約（UNIQUE）を付飾します。
+PostgreSQL のテーブル定義例:
+
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,              -- 自前DB内での連番ID（外部キー用）
+    cognito_sub VARCHAR(255) UNIQUE NOT NULL, -- Cognitoの「sub」を保存（★ここが紐付けの鍵）
+    email VARCHAR(255) NOT NULL,
+    display_name VARCHAR(100),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+------------------------------
+## 2. ユーザー登録（同期）のタイミング
+Cognito にユーザーが登録された際、PostgreSQL にも同時にユーザーレコードを作る必要があります。これには主に2つのアプローチがあります。
+## アプローチA：Cognito Trigger（Lambda）を使う【推奨：確実】
+Cognito には、ユーザー登録完了時に AWS Lambda を自動実行する「Post confirmation trigger（サインアップ後トリガー）」があります。
+
+   1. ユーザーが会員登録する。
+   2. Cognito が登録を完了し、sub を発行する。
+   3. Cognito Trigger が自動で起動し、Lambda 経由で PostgreSQL に sub と email をインサートする。
+
+
+* メリット: フロントエンドのバグや通信エラーに関わらず、必ず DB と同期されます。
+
+## アプローチB：API サーバー側で初回アクセス時に自動生成する【簡単】
+フロントエンドから初めて Kotlin API にリクエストが来た際、DB に cognito_sub が存在しなければ、その場でユーザーレコードを作成します（Lazy作成）。
+
+* メリット: AWS Lambda を追加で実装・管理する必要がありません。
+
+------------------------------
+## 3. Spring Boot（Kotlin）での実装例
+Spring Security がアクセストークン（JWT）を検証すると、コントローラー層で sub の値を簡単に取得できるようになります。
+## ① トークンから sub を抽出するロジック
+Spring Security は認証が成功すると、JwtAuthenticationToken をインジェクションしてくれます。
+
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationTokenimport org.springframework.web.bind.annotation.GetMappingimport org.springframework.web.bind.annotation.RestController
+
+@RestControllerclass UserController(private val userRepository: UserRepository) {
+
+    @GetMapping("/api/me")
+    fun getMyProfile(principal: JwtAuthenticationToken): ResponseEntity<UserResponse> {
+        // JWTのクレームから「sub」を取得
+        val cognitoSub = principal.tokenAttributes["sub"] as String
+        
+        // 自前DB（PostgreSQL）から紐づくユーザー情報を検索
+        val user = userRepository.findByCognitoSub(cognitoSub)
+            ?: return ResponseEntity.status(HttpStatus.NOT_FOUND).build()
+
+        return ResponseEntity.ok(UserResponse(user.displayName, user.email))
+    }
+}
+
+## ② Repository 層の定義（Spring Data JPA）
+
+import org.springframework.data.jpa.repository.JpaRepositoryimport org.springframework.stereotype.Repository
+
+@Repositoryinterface UserRepository : JpaRepository<User, Long> {
+    // cognito_sub をキーにして検索するメソッド
+    fun findByCognitoSub(cognitoSub: String): User?
+}
+
+------------------------------
+## 💡 設計のベストプラクティス
+
+* id と cognito_sub の使い分け:
+アプリ内の他のテーブル（例：orders や comments テーブル）からユーザーを補足する外部キーには、cognito_sub ではなく、自前 DB の id（SERIAL や自前の UUID）を使いましょう。将来万が一 Cognito から別の認証基盤（Auth0 や Firebase など）に移行することになっても、users テーブルの cognito_sub カラムを差し替えるだけで済み、他のテーブルへの影響を最小限に抑えられます。
+* メールアドレスの変更に注意:
+ユーザーが Cognito 側でメールアドレスを変更した場合、自前 DB の email も更新する必要があります。これも Cognito の「ユーザー属性変更トリガー」を使って Lambda から同期するか、ログイン時に Spring Boot 側でトークン内の email クレームを見て DB を上書き更新するロジックを入れておくと安全です。
+
+ユーザー登録の同期方法について、「Lambda（Cognitoトリガー）を使う方法」か「Spring Boot側で初回アクセス時に作る方法」、どちらの設計が現在の開発チームやインフラ構成に合いそうでしょうか？ 必要であれば、選んだ方の具体的な設定やコードについてさらに詳しく解説します。
+
+## JwtAuthenticationToken をインジェクションしてくれます。のところをもっと詳しく
+
+Spring Security（OAuth2 Resource Server）を使うと、APIにリクエストが届いた時点でバックグラウンドで自動的にJWTの検証（署名チェックや有効期限チェック）が完了します。
+検証が成功すると、Spring Securityはそのトークンの情報をJwtAuthenticationTokenというオブジェクトに詰め込み、認証済みユーザーの情報としてSpringのコンテキスト（セキュリティ管理領域）に保存します。
+これをKotlin（Spring Boot）のコントローラーで受け取る具体的な仕組みと、より実用的な使い方を解説します。
+------------------------------
+## 1. なぜ引数に書くだけでデータが取れるのか？
+Spring MVC（Web）には「引数リゾルバー（Argument Resolver）」という仕組みがあります。
+コントローラーの関数の引数に JwtAuthenticationToken や Principal と書くと、Springが「あ、認証情報を求めているな」と自動で判断し、裏側で保持していた認証オブジェクトをインジェクション（注入）してくれます。
+## 2. トークンの中身を覗いてみる
+JwtAuthenticationToken オブジェクトには、Cognitoから送られてきたすべての情報（クレーム）が入っています。
+
+@GetMapping("/api/debug")fun debugToken(principal: JwtAuthenticationToken) {
+    // 1. CognitoのユーザーID (sub)
+    val sub = principal.name // .name を呼ぶだけでデフォルトで sub が取れます
+    
+    // 2. トークンの全属性（クレーム）をマップで取得
+    val attributes: Map<String, Any> = principal.tokenAttributes
+    
+    // 3. 個別の属性を取得
+    val username = attributes["username"] as? String // Cognitoのユーザー名
+    val scope = attributes["scope"] as? String       // 認可スコープ (aws.cognito.signin.user.admin など)
+    val tokenType = attributes["token_use"] as? String // "access" であるはず
+}
+
+------------------------------
+## 3. 実務でよく使うカスタムアノテーション化（さらにスマートにする方法）
+コントローラーの引数に毎回 JwtAuthenticationToken を書いて、そこから principal.tokenAttributes["sub"] と文字列で取り出すのは、コードが冗長になりますし、タイポの危険もあります。
+Spring Bootでは、独自のアノテーションを作って、最初から「Cognitoの sub（文字列）」や「自前DBの User オブジェクトそのもの」を直接インジェクションさせることができます。
+## 実装例：@CognitoSub アノテーションを作る
+① アノテーションの定義
+
+@Target(AnnotationTarget.VALUE_PARAMETER)
+@Retention(AnnotationRetention.RUNTIME)// @AuthenticationPrincipalを使うことで、Spring Securityの認証オブジェクトを直接参照できる
+@AuthenticationPrincipal(expression = "tokenAttributes['sub']")annotation class CognitoSub
+
+② コントローラーでの使い方
+作成した @CognitoSub を使うと、コントローラーのコードがここまでシンプルになります。
+
+@RestControllerclass OrderController(private val userRepository: UserRepository) {
+
+    @PostMapping("/api/orders")
+    fun createOrder(
+        @CognitoSub sub: String, // ★これだけでCognitoの「sub」が直接文字列で入る！
+        @RequestBody request: OrderRequest
+    ): ResponseEntity<Any> {
+        
+        // DBからユーザーを取得
+        val user = userRepository.findByCognitoSub(sub) 
+            ?: return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build()
+            
+        // 注文処理...
+        return ResponseEntity.ok().build()
+    }
+}
+
+------------------------------
+## 4. まとめ：サーバーの負荷が軽い理由
+この一連の処理の中で、Kotlinサーバーは「Cognitoのデータベース」に一度も問い合わせを行っていません。
+フロントから送られてきたトークンを暗号数学的に「正しい」と判定（検証）し、それを JwtAuthenticationToken に変換してコントローラーに渡しているだけです。そのため、PostgreSQLへのアクセス以外でサーバーに余計なネットワーク負荷がかからず、非常に高速に動作します。
+この仕組みを使って、例えばユーザーの役割（Admin、Generalなどの「権限・ロール」）をCognito側で付与し、Spring Boot側で「管理者だけが叩けるAPI」といったアクセス制限（@PreAuthorizeなど）を実装する方法についても興味はありますか？
+
