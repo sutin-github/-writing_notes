@@ -404,10 +404,12 @@ import org.springframework.data.jpa.repository.JpaRepositoryimport org.springfra
 Spring Security（OAuth2 Resource Server）を使うと、APIにリクエストが届いた時点でバックグラウンドで自動的にJWTの検証（署名チェックや有効期限チェック）が完了します。
 検証が成功すると、Spring Securityはそのトークンの情報をJwtAuthenticationTokenというオブジェクトに詰め込み、認証済みユーザーの情報としてSpringのコンテキスト（セキュリティ管理領域）に保存します。
 これをKotlin（Spring Boot）のコントローラーで受け取る具体的な仕組みと、より実用的な使い方を解説します。
+
 ------------------------------
 ## 1. なぜ引数に書くだけでデータが取れるのか？
 Spring MVC（Web）には「引数リゾルバー（Argument Resolver）」という仕組みがあります。
 コントローラーの関数の引数に JwtAuthenticationToken や Principal と書くと、Springが「あ、認証情報を求めているな」と自動で判断し、裏側で保持していた認証オブジェクトをインジェクション（注入）してくれます。
+
 ## 2. トークンの中身を覗いてみる
 JwtAuthenticationToken オブジェクトには、Cognitoから送られてきたすべての情報（クレーム）が入っています。
 
